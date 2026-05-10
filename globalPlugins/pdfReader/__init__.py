@@ -24,42 +24,98 @@ except ImportError:
 addonHandler.initTranslation()
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Constants
 # ---------------------------------------------------------------------------
 
-# Characters of surrounding text included in every NVDA match announcement.
+# Characters of surrounding text on each side of a match for NVDA announcements.
 _CONTEXT_CHARS = 80
+
+# Minimum non-whitespace characters a page must have before we consider it
+# "text-bearing" and skip OCR.
+_MIN_TEXT_CHARS = 20
+
+# DPI used when rasterising pages for OCR.  150 is a good speed/accuracy trade-off.
+_OCR_DPI = 150
+
+
+# ---------------------------------------------------------------------------
+# Text extraction helpers
+# ---------------------------------------------------------------------------
+
+def _is_text_bearing(raw_text):
+    """Return True if the raw text string has enough real content to be useful."""
+    return len(raw_text.replace(" ", "").replace("\n", "")) >= _MIN_TEXT_CHARS
 
 
 def extract_page_text(page):
     """
-    Extract text from a PDF page using block-based extraction for better
-    reading order and structure.  Falls back to plain get_text() when blocks
-    yield nothing useful (e.g. image-only or malformed pages).
+    Extract readable text from a PDF page.
+
+    Strategy:
+      1. Try block-based extraction (preserves reading order better than plain
+         get_text()).
+      2. If the result is essentially empty, try PyMuPDF's built-in OCR bridge
+         (requires Tesseract to be installed on the system).
+      3. If OCR is unavailable or also fails, return a clear message so NVDA
+         can announce the situation to the user.
+
+    The OCR path is what makes inaccessible / scanned / image-only PDFs (e.g.
+    old books digitised as photos) readable.
     """
+    # ---- Step 1: block-based extraction ----
     blocks = page.get_text("blocks")  # (x0, y0, x1, y1, text, block_no, block_type)
     blocks_sorted = sorted(blocks, key=lambda b: (round(b[1] / 10), b[0]))
     lines = []
     for block in blocks_sorted:
-        if block[6] == 0:  # text block (not image)
+        if block[6] == 0:           # 0 = text block (not image block)
             text = block[4].strip()
             if text:
                 lines.append(text)
     result = "\n\n".join(lines)
-    if not result.strip():
+
+    # Plain fallback within native extraction
+    if not _is_text_bearing(result):
         result = page.get_text().strip()
-    return result if result else _("[No readable text on this page]")
+
+    if _is_text_bearing(result):
+        return result
+
+    # ---- Step 2: OCR via Tesseract (for scanned / image-only pages) ----
+    try:
+        # get_textpage_ocr() rasterises the page and runs Tesseract on it.
+        # It raises RuntimeError if Tesseract is not found on the system.
+        ocr_textpage = page.get_textpage_ocr(
+            flags=0,
+            full=False,      # False = only OCR areas that lack selectable text
+            dpi=_OCR_DPI,
+            language="eng",  # Tesseract language code; "eng" is always present
+            tessdata=None,   # None = let Tesseract find its own data directory
+        )
+        ocr_text = page.get_text(textpage=ocr_textpage).strip()
+        if _is_text_bearing(ocr_text):
+            return ocr_text
+        # OCR ran but found nothing (truly blank page or non-latin script)
+        return _("[Page appears blank or contains no recognisable text]")
+    except RuntimeError:
+        # Tesseract is not installed on this machine.
+        return _(
+            "[This page contains no selectable text. "
+            "Install Tesseract to enable OCR for scanned pages.]"
+        )
+    except Exception:
+        # Any other OCR error — still better to degrade gracefully.
+        return _("[Unable to extract text from this page]")
 
 
 def _context_snippet(text, char_start, char_end, context=_CONTEXT_CHARS):
     """
-    Return a short string centred on the match so NVDA reads the surrounding
-    sentence, not just the bare matched word.
+    Return a short string centred on [char_start:char_end] so NVDA reads the
+    surrounding sentence rather than just the bare matched word.
 
     Format:  "…before [MATCH] after…"
     """
     before_start = max(0, char_start - context)
-    after_end = min(len(text), char_end + context)
+    after_end    = min(len(text), char_end + context)
 
     before = text[before_start:char_start].lstrip("\n")
     match  = text[char_start:char_end]
@@ -80,7 +136,7 @@ def _context_snippet(text, char_start, char_end, context=_CONTEXT_CHARS):
 class ProcessingDialog(wx.Dialog):
     def __init__(self, parent, message=None):
         super(ProcessingDialog, self).__init__(parent, title=_("Processing..."))
-        self.SetSize((340, 120))
+        self.SetSize((360, 120))
         self.Centre()
         main_sizer = wx.BoxSizer(wx.VERTICAL)
         self.label = wx.StaticText(
@@ -130,7 +186,7 @@ class AboutDialog(wx.Dialog):
 class HelpDialog(wx.Dialog):
     def __init__(self, parent):
         super(HelpDialog, self).__init__(parent, title=_("Help for the PDF reader"))
-        self.SetSize((520, 470))
+        self.SetSize((520, 500))
         self.Centre()
         main_sizer = wx.BoxSizer(wx.VERTICAL)
         instructions = _(
@@ -140,19 +196,24 @@ class HelpDialog(wx.Dialog):
             "3. Use Alt+N for the next page.\n"
             "4. Use Alt+P for the previous page.\n"
             "5. Use the page dropdown to jump to a specific page.\n\n"
+            "Scanned / image-only PDFs:\n"
+            "   If a page has no selectable text the add-on will automatically\n"
+            "   run OCR via Tesseract (if installed) to make the text readable.\n\n"
             "Global Find (searches the entire document):\n"
-            "6. Press Ctrl+F or click the 'Find' button to open the search bar.\n"
-            "7. Type your search term — the add-on indexes all pages in the background.\n"
-            "8. Press Enter or F3 to jump to the next match.\n"
+            "6. Press Ctrl+F or click 'Find' to open the search bar.\n"
+            "7. Type your search term — all pages are indexed in the background.\n"
+            "8. Press Enter or F3 to jump to the next match anywhere in the document.\n"
             "9. Press Shift+F3 to jump to the previous match.\n"
-            "10. NVDA will read the match count, page number, and surrounding\n"
-            "    sentence context so you know exactly where you have landed.\n"
-            "11. Press Escape to close the find bar.\n\n"
-            "12. Use the Back button to return to the main menu.\n"
-            "13. Use the Close button to exit the add-on."
+            "10. NVDA reads the match number, page, and surrounding sentence so\n"
+            "    you know exactly where you have landed.\n"
+            "11. Pressing F3/Shift+F3 continues from where you left off — it does\n"
+            "    not restart from the beginning unless you change the search term.\n"
+            "12. Press Escape to close the find bar.\n\n"
+            "13. Use Back to return to the main menu.\n"
+            "14. Use Close to exit the add-on."
         )
         message = wx.StaticText(self, label=instructions)
-        message.Wrap(470)
+        message.Wrap(480)
         main_sizer.Add(message, 0, wx.ALL | wx.EXPAND, 15)
         back_button = wx.Button(self, label=_("&Back"))
         self.Bind(wx.EVT_BUTTON, self.on_back, back_button)
@@ -170,15 +231,15 @@ class HelpDialog(wx.Dialog):
 
 class FindBar(wx.Panel):
     """
-    Collapsible find-bar panel.  All search logic lives in PdfDialog; this
-    panel only handles user input and result/progress display.
+    Collapsible find-bar panel.  All search/index logic lives in PdfDialog;
+    this panel is purely responsible for user input and status display.
     """
 
     def __init__(self, parent, on_find_next, on_find_prev, on_close_cb):
         super(FindBar, self).__init__(parent)
         self._on_find_next = on_find_next
         self._on_find_prev = on_find_prev
-        self._on_close_cb = on_close_cb
+        self._on_close_cb  = on_close_cb
 
         sizer = wx.BoxSizer(wx.HORIZONTAL)
 
@@ -189,7 +250,7 @@ class FindBar(wx.Panel):
         self.search_ctrl.SetHint(_("Search entire document…"))
         sizer.Add(self.search_ctrl, 1, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 5)
 
-        # Live status: "Indexing page 3 of 50…" / "Match 2 of 17" / "Not found"
+        # Status label: shows indexing progress or match position
         self.result_label = wx.StaticText(self, label="")
         sizer.Add(self.result_label, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 10)
 
@@ -206,9 +267,9 @@ class FindBar(wx.Panel):
         self.SetSizer(sizer)
 
         self.search_ctrl.Bind(wx.EVT_TEXT_ENTER, lambda e: self._on_find_next())
-        self.search_ctrl.Bind(wx.EVT_KEY_DOWN, self._on_key_down)
-        next_btn.Bind(wx.EVT_BUTTON, lambda e: self._on_find_next())
-        prev_btn.Bind(wx.EVT_BUTTON, lambda e: self._on_find_prev())
+        self.search_ctrl.Bind(wx.EVT_KEY_DOWN,   self._on_key_down)
+        next_btn.Bind(wx.EVT_BUTTON,  lambda e: self._on_find_next())
+        prev_btn.Bind(wx.EVT_BUTTON,  lambda e: self._on_find_prev())
         close_btn.Bind(wx.EVT_BUTTON, lambda e: self._on_close_cb())
 
     def _on_key_down(self, event):
@@ -242,23 +303,41 @@ class FindBar(wx.Panel):
 class PdfDialog(wx.Dialog):
     def __init__(self, parent, pdf_doc, pdf_path=""):
         super(PdfDialog, self).__init__(parent, title=_("PDF reader panel"))
-        self.pdf_doc  = pdf_doc
-        self.pdf_path = pdf_path
+        self.pdf_doc      = pdf_doc
+        self.pdf_path     = pdf_path
         self.current_page = 0
         self.total_pages  = len(pdf_doc)
-        self.SetSize((660, 580))
+        self.SetSize((680, 600))
         self.Centre()
 
-        # Page-text cache – populated on demand and during background indexing.
-        self._page_cache  = {}
-        self._cache_lock  = threading.Lock()
+        # Page-text cache.  Populated on demand and also pre-filled by the
+        # background indexing thread.  Protected by _cache_lock.
+        self._page_cache = {}
+        self._cache_lock = threading.Lock()
 
-        # ---- Find state ----
-        # _find_matches : list[(page_num, char_start, char_end)] across ALL pages
-        # _last_query   : query string that produced _find_matches (used to detect stale cache)
-        # _find_index   : current position in _find_matches  (-1 = not yet jumped)
-        # _find_thread  : background indexing thread, or None
-        # _find_abort   : threading.Event – set it to cancel the running thread
+        # ---------------------------------------------------------------
+        # Find state
+        #
+        # The key insight for the "resets to start" bug:
+        #
+        #   We must NOT tie query invalidation to EVT_TEXT on the search
+        #   control.  EVT_TEXT fires for every character typed, but also
+        #   fires whenever we call SetValue() or SelectAll() programmatically
+        #   (e.g. when re-opening the find bar), which falsely resets
+        #   _find_index back to -1 mid-session.
+        #
+        #   Instead we compare get_query() against _last_query only at the
+        #   moment the user actually requests a find.  If they match, we
+        #   advance from the current _find_index.  If they differ, we start
+        #   a fresh index run.  The user can press F3 as many times as they
+        #   like without the position ever resetting unexpectedly.
+        #
+        # _find_matches : list[(page_num, char_start, char_end)] – global
+        # _last_query   : query whose results fill _find_matches
+        # _find_index   : current position (-1 = first press not yet made)
+        # _find_thread  : background indexing thread (or None)
+        # _find_abort   : set this Event to cancel a running thread
+        # ---------------------------------------------------------------
         self._find_matches = []
         self._last_query   = ""
         self._find_index   = -1
@@ -278,15 +357,16 @@ class PdfDialog(wx.Dialog):
         self.text_ctrl.Bind(wx.EVT_KEY_DOWN, self._on_text_key_down)
         main_sizer.Add(self.text_ctrl, 1, wx.LEFT | wx.RIGHT | wx.EXPAND, 8)
 
+        # NOTE: we deliberately do NOT bind EVT_TEXT on find_bar.search_ctrl
+        # to any invalidation handler.  Invalidation happens inside
+        # _ensure_matches() by comparing the live query to _last_query.
         self.find_bar = FindBar(
             self,
             on_find_next=self._find_next,
             on_find_prev=self._find_prev,
-            on_close_cb=self._close_find_bar,
+            on_close_cb =self._close_find_bar,
         )
         self.find_bar.Hide()
-        # Invalidate the match cache whenever the user edits the search field.
-        self.find_bar.search_ctrl.Bind(wx.EVT_TEXT, self._on_find_query_changed)
         main_sizer.Add(self.find_bar, 0, wx.ALL | wx.EXPAND, 4)
 
         nav_sizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -330,9 +410,9 @@ class PdfDialog(wx.Dialog):
         id_next = wx.NewId()
         id_prev = wx.NewId()
         self.SetAcceleratorTable(wx.AcceleratorTable([
-            wx.AcceleratorEntry(wx.ACCEL_CTRL,   ord("F"),      id_open),
-            wx.AcceleratorEntry(wx.ACCEL_NORMAL,  wx.WXK_F3,   id_next),
-            wx.AcceleratorEntry(wx.ACCEL_SHIFT,   wx.WXK_F3,   id_prev),
+            wx.AcceleratorEntry(wx.ACCEL_CTRL,   ord("F"),    id_open),
+            wx.AcceleratorEntry(wx.ACCEL_NORMAL,  wx.WXK_F3, id_next),
+            wx.AcceleratorEntry(wx.ACCEL_SHIFT,   wx.WXK_F3, id_prev),
         ]))
         self.Bind(wx.EVT_MENU, lambda e: self._open_find_bar(), id=id_open)
         self.Bind(wx.EVT_MENU, lambda e: self._find_next(),     id=id_next)
@@ -342,7 +422,7 @@ class PdfDialog(wx.Dialog):
         self.status_text.SetFocus()
 
     # ------------------------------------------------------------------
-    # Page text extraction & caching
+    # Page text – cached extraction with OCR fallback
     # ------------------------------------------------------------------
 
     def _get_page_text(self, page_num):
@@ -353,7 +433,7 @@ class PdfDialog(wx.Dialog):
             return self._page_cache[page_num]
 
     # ------------------------------------------------------------------
-    # Status & page loading
+    # Status bar & page loading
     # ------------------------------------------------------------------
 
     def update_status(self):
@@ -409,7 +489,7 @@ class PdfDialog(wx.Dialog):
         event.Skip()
 
     # ------------------------------------------------------------------
-    # Find bar open / close
+    # Find bar – open / close
     # ------------------------------------------------------------------
 
     def _open_find_bar(self):
@@ -422,6 +502,7 @@ class PdfDialog(wx.Dialog):
         self.find_bar.Hide()
         self.Layout()
         self._clear_highlights()
+        # Reset find state fully so next open starts clean.
         self._find_matches = []
         self._last_query   = ""
         self._find_index   = -1
@@ -431,38 +512,30 @@ class PdfDialog(wx.Dialog):
     # Background indexing – global find across ALL pages
     # ------------------------------------------------------------------
 
-    def _on_find_query_changed(self, event):
-        """Invalidate the match cache whenever the user edits the search field."""
-        self._abort_find_thread()
-        self._find_matches = []
-        self._last_query   = ""
-        self._find_index   = -1
-        self.find_bar.set_result("")
-        event.Skip()
-
     def _abort_find_thread(self):
+        """Signal any running index thread to stop and wait for it."""
         if self._find_thread and self._find_thread.is_alive():
             self._find_abort.set()
-            self._find_thread.join(timeout=1.0)
+            self._find_thread.join(timeout=1.5)
         self._find_abort.clear()
         self._find_thread = None
 
     def _start_index_thread(self, query, on_done):
         """
-        Spin up a background thread that searches every page for `query`.
-        Calls `on_done(matches)` on the main thread when finished.
-        Progress is shown live in the find-bar label.
+        Search every page for `query` in a background thread.
+        Reports live progress in the find-bar label via wx.CallAfter.
+        Calls on_done(matches) on the main thread when complete.
         """
         self._abort_find_thread()
         abort_event = self._find_abort
-        total = self.total_pages
+        total       = self.total_pages
 
         def run():
             matches = []
             q = query.lower()
             for p in range(total):
                 if abort_event.is_set():
-                    return  # abandoned; do NOT call on_done
+                    return  # cancelled — do NOT call on_done
                 text       = self._get_page_text(p)
                 lower_text = text.lower()
                 start = 0
@@ -472,7 +545,6 @@ class PdfDialog(wx.Dialog):
                         break
                     matches.append((p, idx, idx + len(q)))
                     start = idx + 1
-                # Update progress label (safe – wx.CallAfter posts to main thread)
                 wx.CallAfter(
                     self.find_bar.set_result,
                     _("Indexing page {current} of {total}…").format(
@@ -486,16 +558,27 @@ class PdfDialog(wx.Dialog):
 
     def _ensure_matches(self, query, callback):
         """
-        If a valid match list already exists for `query`, call callback immediately.
-        Otherwise start background indexing and call callback when done.
+        Core find-state manager.
+
+        - If `query` matches _last_query, the match list is already valid and
+          we call callback immediately, preserving _find_index so the user
+          continues from where they left off.
+        - If `query` is different, we start a fresh background index run and
+          reset _find_index to -1 so the next jump starts from match 1.
+
+        This is the fix for the "always resets to start" bug: we never touch
+        _find_index or _find_matches based on UI events (EVT_TEXT etc.) —
+        only here, at the moment the user actually presses Find Next/Prev.
         """
-        if query == self._last_query and self._find_matches is not None:
+        if query == self._last_query:
+            # Same query as before → match list is valid, index is preserved.
             callback(self._find_matches)
             return
 
-        # Reset and kick off a fresh index run.
+        # New query → reset position and start fresh indexing.
         self._find_matches = []
         self._last_query   = query
+        self._find_index   = -1
         self.find_bar.set_result(_("Indexing…"))
 
         def on_done(matches):
@@ -505,7 +588,7 @@ class PdfDialog(wx.Dialog):
         self._start_index_thread(query, on_done)
 
     # ------------------------------------------------------------------
-    # Find next / prev (called from find bar and accelerators)
+    # Find next / prev (called from find bar buttons and accelerators)
     # ------------------------------------------------------------------
 
     def _find_next(self):
@@ -517,11 +600,14 @@ class PdfDialog(wx.Dialog):
         def after_index(matches):
             if not matches:
                 self.find_bar.set_result(_("Not found"))
-                ui.message(_("'{query}' was not found in this document.").format(query=query))
+                ui.message(
+                    _("'{query}' was not found in this document.").format(query=query)
+                )
                 return
             old_index        = self._find_index
             self._find_index = (self._find_index + 1) % len(matches)
-            wrapped          = old_index >= 0 and self._find_index < old_index
+            # wrapped = we crossed from the last match back to the first
+            wrapped = (old_index >= 0) and (self._find_index < old_index)
             self._jump_to_match(self._find_index, wrapped=wrapped, direction="next")
 
         self._ensure_matches(query, after_index)
@@ -535,7 +621,9 @@ class PdfDialog(wx.Dialog):
         def after_index(matches):
             if not matches:
                 self.find_bar.set_result(_("Not found"))
-                ui.message(_("'{query}' was not found in this document.").format(query=query))
+                ui.message(
+                    _("'{query}' was not found in this document.").format(query=query)
+                )
                 return
             if self._find_index <= 0:
                 self._find_index = len(matches) - 1
@@ -552,16 +640,16 @@ class PdfDialog(wx.Dialog):
     # ------------------------------------------------------------------
 
     def _jump_to_match(self, index, wrapped=False, direction="next"):
-        matches              = self._find_matches
+        matches                        = self._find_matches
         page_num, char_start, char_end = matches[index]
-        total                = len(matches)
+        total                          = len(matches)
 
         result_msg = _("Match {current} of {total}  —  page {page}").format(
             current=index + 1, total=total, page=page_num + 1
         )
         self.find_bar.set_result(result_msg)
 
-        # Navigate to the page if the match is on a different page.
+        # Switch pages only when necessary.
         if page_num != self.current_page:
             self.current_page = page_num
             text = self._get_page_text(page_num)
@@ -569,7 +657,7 @@ class PdfDialog(wx.Dialog):
             self.page_choice.SetSelection(page_num)
             self.update_status()
 
-        # Yellow highlight on the matched text.
+        # Yellow highlight.
         self._clear_highlights()
         self.text_ctrl.SetStyle(
             char_start, char_end,
@@ -578,9 +666,9 @@ class PdfDialog(wx.Dialog):
         self.text_ctrl.ShowPosition(char_start)
         self.text_ctrl.SetSelection(char_start, char_end)
 
-        # ---- Accessible NVDA announcement ----
-        # Read ~80 chars of surrounding text so the user hears the sentence
-        # context around the match, not just its position.
+        # ---- NVDA announcement with surrounding context ----
+        # Read ~80 chars either side of the match so the user hears the
+        # sentence it lives in, not just "Match 3 of 17".
         page_text = self._get_page_text(page_num)
         snippet   = _context_snippet(page_text, char_start, char_end)
 
@@ -602,7 +690,7 @@ class PdfDialog(wx.Dialog):
         )
 
     # ------------------------------------------------------------------
-    # Highlight helpers
+    # Helpers
     # ------------------------------------------------------------------
 
     def _clear_highlights(self):
@@ -715,7 +803,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         self.create_menu()
 
     def create_menu(self):
-        self.tools_menu    = gui.mainFrame.sysTrayIcon.toolsMenu
+        self.tools_menu      = gui.mainFrame.sysTrayIcon.toolsMenu
         self.pdf_reader_item = self.tools_menu.Append(
             wx.ID_ANY, _("PDF &Reader"), _("Open PDF Reader"),
         )
